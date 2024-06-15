@@ -1,5 +1,5 @@
 # End to End Evaluation Template for RAG Apps
-A working streamlit app having end to end evaluation for more than 50+ metrics to evaluate your production. This is the template and by using FastAPI with NewRelic or Prometheus on the metrics, you can do even more. also there are LLMasJudge abstract classes which are useful to use GPt-4 type as evaluator. For more details look for `SEE_THIS.ipynb`
+This is a template and you add or remove metrics based on your usecases. Also there are `LLMasJudge` abstract classes which are useful to use [PHUDGE](https://github.com/deshwalmahesh/PHUDGE/) and GPT4 type of LLMs as evaluator. For more details to understand the evaluations, look inside `SEE_THIS.ipynb`
 
 ![Alt Text](./APP.png)
 
