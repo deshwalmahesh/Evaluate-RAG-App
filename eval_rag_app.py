@@ -1,19 +1,18 @@
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import LanceDB
 from langchain.chains.question_answering import load_qa_chain
-from langchain.chains.qa_with_sources.retrieval import RetrievalQAWithSourcesChain
 from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores.faiss import DistanceStrategy
 from eval_metrics import * 
 
 if 'api_key' not in st.session_state: st.session_state['api_key'] = None
 if 'user_turn' not in st.session_state: st.session_state['user_turn'] = False
 if 'pdf' not in st.session_state: st.session_state['pdf'] = None
 if "embed_model" not in st.session_state: st.session_state['embed_model'] = None
+if "vector_store" not in st.session_state: st.session_state['vector_store'] = None
 if "eval_models" not in st.session_state: st.session_state["eval_models"] = {"app_metrics": AppMetrics()}
 
 st.set_page_config(page_title="Document Genie", layout="wide")
@@ -26,19 +25,16 @@ def get_pdf_text(pdf_docs):
             text += page.extract_text()
     return text
 
+
 @AppMetrics.measure_execution_time
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
-    chunks = text_splitter.split_text(text)
-    return chunks
+def build_vector_store(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size = st.session_state['chunk_size'] , chunk_overlap= st.session_state['chunk_overlap'])
+    text_chunks = text_splitter.split_text(text)
+    st.session_state['vector_store']= LanceDB.from_texts(text_chunks, st.session_state["embed_model"])
 
-
-def get_vector_store(text_chunks):
-    # embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=st.session_state['api_key'])
-    vector_store = FAISS.from_texts(text_chunks, embedding=st.session_state['embed_model'], 
-                                    distance_strategy=DistanceStrategy.DOT_PRODUCT)
-    vector_store.save_local("faiss_index")
-
+@AppMetrics.measure_execution_time
+def fetch_context(query):
+    return st.session_state['vector_store'].similarity_search(query, k = st.session_state['top_k'])
 
 def get_conversational_chain():
     prompt_template = """
@@ -59,31 +55,20 @@ def llm_output(chain, docs, user_question):
     return chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
 
 
-@AppMetrics.measure_execution_time
-def fetch_context(new_db, user_question, k = 3, distance_strategy=DistanceStrategy.DOT_PRODUCT):
-    return new_db.similarity_search_with_score(user_question, k = 3, distance_strategy=DistanceStrategy.DOT_PRODUCT)
-
-@st.cache_data
 def user_input(user_question):
-    # embeddings =  OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=st.session_state['api_key'])
-    new_db = FAISS.load_local("faiss_index", st.session_state['embed_model'], 
-                              allow_dangerous_deserialization=True, 
-                              distance_strategy=DistanceStrategy.DOT_PRODUCT)
-    
-    contexts_with_scores, exec_time = fetch_context(new_db, user_question, k = 3, distance_strategy=DistanceStrategy.DOT_PRODUCT)
+    contexts_with_scores, exec_time = fetch_context(user_question)
     st.session_state["eval_models"]["app_metrics"].exec_times["chunk_fetch_time"] = exec_time
 
-    docs = [i[0] for i in contexts_with_scores]
     chain = get_conversational_chain()
-    response, exec_time = llm_output(chain, docs, user_question)
+    response, exec_time = llm_output(chain, contexts_with_scores, user_question)
     st.session_state["eval_models"]["app_metrics"].exec_times["llm_resp_time"] = exec_time
     
     st.write("Reply: ", response["output_text"])
 
     ctx = ""
-    for (item, score) in contexts_with_scores:
+    for item in contexts_with_scores:
         if len(item.page_content.strip()):
-            ctx += f"<li>Similarity Score: {round(float(score), 2)}<br>Context: {item.page_content}<br>&nbsp</li>"
+            ctx += f"<li>Similarity Score: {round(float(item.metadata['_distance']), 2)}<br>Context: {item.page_content}<br>&nbsp</li>"
 
     with st.expander("Click to see the context passed"):
         st.markdown(f"""<ol>{ctx}</ol>""", unsafe_allow_html=True)
@@ -162,21 +147,24 @@ def main():
     with st.sidebar:
         st.title("Menu:")
         st.session_state['api_key'] = st.text_input("Enter your OpenAI API Key:", type="password", key="api_key_input")
+
+        _ =  st.number_input("Top-K Contxets to fetch", min_value = 1, max_value = 50, value = 3, step = 1, key="top_k")
+        _ = st.number_input("Chunk Length", min_value = 8, max_value = 4096, value = 512, step = 8, key="chunk_size")
+        _ = st.number_input("Chunk Overlap Length", min_value = 4, max_value = 2048, value = 64, step = 1, key="chunk_overlap")
+
         st.session_state["pdf"] = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True, key="pdf_uploader")
-       
+
+
         if st.session_state["pdf"]:
             if st.session_state["embed_model"] is None: 
                 with st.spinner("Setting up `all-MiniLM-L6-v2` for the first time"):
                     st.session_state["embed_model"] = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
-            with st.spinner("Processing PDF files into chunks and creating `FAISS` Index..."):
-                raw_text = get_pdf_text(st.session_state["pdf"])
-                text_chunks, exec_time = get_text_chunks(raw_text)
-
+            with st.spinner("Processing PDF files..."): raw_text = get_pdf_text(st.session_state["pdf"])
+            with st.spinner("Creating `LanceDB` Vector strores from texts..."):
+                _, exec_time = build_vector_store(raw_text)
                 st.session_state["eval_models"]["app_metrics"].exec_times["chunk_creation_time"] = exec_time
-
-                get_vector_store(text_chunks)
                 st.success("Done")
 
 
@@ -187,7 +175,8 @@ def main():
         user_question = st.text_input("", key="user_question")
 
         if user_question and st.session_state['api_key']:  # Ensure API key and user question are provided
-            contexts_with_scores, response = user_input(user_question)
+            with st.spinner("Getting Response from LLM..."):
+                contexts_with_scores, response = user_input(user_question)
         
             st.warning("There are 5 major types metrics computed below having multiple sub metrics. Also, 2 abstract classes are defined `LLMasEvaluator` (to use any LLM as a judge) and `TraditionalPipelines` (for Topics, NER, POS etc)", icon="🤖")
             metric_calc = st.button("Load Models & Compute Evaluation Metrics")
@@ -202,7 +191,7 @@ def main():
                         })
 
                 with st.spinner("Calculating all the matrices. Please wait ...."):
-                    eval_result = evaluate_all(user_question, [item.page_content for (item, score) in contexts_with_scores], response)
+                    eval_result = evaluate_all(user_question, [item.page_content for item in contexts_with_scores], response)
                     st.balloons()
 
                 # with st.expander("Click to see all the evaluation metrics"):
